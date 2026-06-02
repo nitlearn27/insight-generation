@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Shopping Assistant - Insight Generator</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --chat-bg: rgba(30, 41, 59, 0.7);
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: rgba(255, 255, 255, 0.1);
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #020617 0%, #0f172a 50%, #1e1b4b 100%);
+            color: var(--text-main);
+            height: 100vh;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .chat-container {
+            width: 520px;
+            height: 85vh;
+            background: var(--chat-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+            overflow: hidden;
+        }
+
+        .chat-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(15, 23, 42, 0.4);
+        }
+
+        .chat-header h2 {
+            margin: 0;
+            font-size: 1.15rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            letter-spacing: -0.025em;
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            background: #10b981;
+            border-radius: 50%;
+            box-shadow: 0 0 12px #10b981;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+            scroll-behavior: smooth;
+        }
+
+        /* Custom Scrollbar */
+        .chat-messages::-webkit-scrollbar {
+            width: 6px;
+        }
+        .chat-messages::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+        }
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.25);
+        }
+
+        .message {
+            max-width: 88%;
+            padding: 14px 18px;
+            border-radius: 18px;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            animation: fadeIn 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        .system-msg {
+            background: rgba(255, 255, 255, 0.05);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.03);
+        }
+
+        .user-msg {
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.25);
+        }
+
+        .insight-card {
+            background: linear-gradient(145deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.9));
+            border: 1px solid rgba(139, 92, 246, 0.2);
+            border-radius: 16px;
+            padding: 18px;
+            margin-top: 12px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+            transition: transform 0.2s, border-color 0.2s;
+        }
+
+        .insight-card:hover {
+            transform: translateY(-2px);
+            border-color: rgba(139, 92, 246, 0.45);
+        }
+
+        .insight-card h3 {
+            margin: 0;
+            font-size: 1.05rem;
+            color: #a78bfa;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+
+        .insight-card .price {
+            font-weight: 700;
+            font-size: 1.25rem;
+            margin: 8px 0;
+            color: #3b82f6;
+        }
+
+        .insight-card .reasoning {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            line-height: 1.5;
+            margin-bottom: 14px;
+            border-left: 2.5px solid rgba(139, 92, 246, 0.5);
+            padding-left: 10px;
+        }
+
+        .insight-card a {
+            display: inline-block;
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(59, 130, 246, 0.2));
+            color: #c4b5fd;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            border: 1px solid rgba(139, 92, 246, 0.25);
+            transition: all 0.2s;
+        }
+
+        .insight-card a:hover {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.4), rgba(59, 130, 246, 0.4));
+            border-color: rgba(139, 92, 246, 0.5);
+            color: white;
+            box-shadow: 0 4px 12px rgba(139, 92, 246, 0.15);
+        }
+
+        .chat-input-area {
+            padding: 20px 24px;
+            border-top: 1px solid var(--border);
+            background: rgba(15, 23, 42, 0.5);
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .input-text {
+            background: rgba(15, 23, 42, 0.65);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-main);
+            padding: 12px 16px;
+            font-size: 0.95rem;
+            outline: none;
+            transition: all 0.3s ease;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .input-text:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+            background: rgba(15, 23, 42, 0.85);
+        }
+
+        .btn-generate {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            color: white;
+            font-weight: 700;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 4px 12px rgba(139, 92, 246, 0.25);
+        }
+
+        .btn-generate:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 24px -8px rgba(139, 92, 246, 0.7);
+        }
+
+        .btn-generate:active {
+            transform: translateY(0);
+        }
+
+        .btn-generate:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .loader {
+            display: none;
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="chat-container">
+        <div class="chat-header">
+            <h2><div class="status-dot"></div> Shopping Assistant</h2>
+        </div>
+        
+        <div class="chat-messages" id="chat-messages">
+            <div class="message system-msg">
+                Hello! I can analyze your recent purchases and recommend personalized items you should buy next. You can describe your specific preferences or search intent below.
+            </div>
+            <!-- Messages will appear here -->
+        </div>
+
+        <div class="chat-input-area">
+            <input type="text" class="input-text" id="user-input-field" placeholder="Describe preferences (e.g. 'Amazon only', 'low price dairy')..." title="Your Preferences" />
+            
+            <button class="btn-generate" id="generate-btn" onclick="generateInsight()">
+                <span>✨ Generate Insight</span>
+                <div class="loader" id="loader"></div>
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const chatMessages = document.getElementById('chat-messages');
+        const generateBtn = document.getElementById('generate-btn');
+        const loader = document.getElementById('loader');
+        const userInputField = document.getElementById('user-input-field');
+
+        // Allow sending message with Enter key
+        userInputField.addEventListener('keypress', function (e) {
+            if (e.key === 'Enter' && !generateBtn.disabled) {
+                generateInsight();
+            }
+        });
+
+        function appendMessage(content, type) {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `message ${type}`;
+            msgDiv.innerHTML = content;
+            chatMessages.appendChild(msgDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        async function generateInsight() {
+            const userInput = userInputField.value;
+            let userMsgText = userInput.trim() !== '' ? userInput : "Generate logical product recommendations for me.";
+
+            // Disable button & show loader
+            generateBtn.disabled = true;
+            generateBtn.querySelector('span').innerText = 'Analyzing...';
+            loader.style.display = 'block';
+
+            appendMessage(userMsgText, "user-msg");
+            userInputField.value = ''; // Clear input
+
+            try {
+                const response = await fetch('http://127.0.0.1:8000/api/insights/next-purchase', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        user_input: userMsgText
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('API request failed');
+                }
+
+                const data = await response.json();
+                
+                let htmlContent = `<div style="font-weight: 500; font-size: 0.95rem; margin-bottom: 8px;">${data.insight_message}</div>`;
+                
+                if (data.recommendations && data.recommendations.length > 0) {
+                    data.recommendations.forEach(rec => {
+                        const isAmazon = rec.product_url.toLowerCase().includes('amazon');
+                        const isFlipkart = rec.product_url.toLowerCase().includes('flipkart');
+                        const storeLabel = isAmazon ? 'Amazon' : (isFlipkart ? 'Flipkart' : 'Store');
+                        const badgeStyle = isAmazon 
+                            ? 'background: rgba(255, 153, 0, 0.15); color: #ff9900;' 
+                            : (isFlipkart ? 'background: rgba(40, 116, 240, 0.15); color: #2874f0;' : 'background: rgba(139, 92, 246, 0.15); color: #c4b5fd;');
+
+                        const ratingText = rec.rating ? `⭐ ${rec.rating} Rating` : 'No rating';
+
+                        htmlContent += `
+                            <div class="insight-card">
+                                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px;">
+                                    <h3>${rec.product_name}</h3>
+                                    <span style="font-size: 0.75rem; padding: 3px 10px; border-radius: 12px; font-weight: 700; white-space: nowrap; ${badgeStyle}">
+                                        ${storeLabel}
+                                    </span>
+                                </div>
+                                <div class="price">₹${rec.price}</div>
+                                <div class="reasoning">${rec.reasoning}</div>
+                                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                                    <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">${ratingText}</span>
+                                    <a href="${rec.product_url}" target="_blank">View Product &rarr;</a>
+                                </div>
+                            </div>
+                        `;
+                    });
+                } else {
+                    htmlContent += `<div style="color: var(--text-muted); font-style: italic; font-size: 0.9rem; margin-top: 8px;">No matching recommendations found for your selection.</div>`;
+                }
+
+                appendMessage(htmlContent, "system-msg");
+
+            } catch (error) {
+                console.error(error);
+                appendMessage("Sorry, I encountered an error while generating your insights.", "system-msg");
+            } finally {
+                // Reset button
+                generateBtn.disabled = false;
+                generateBtn.querySelector('span').innerText = '✨ Generate Insight';
+                loader.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Ignore virtual environment
+venv/
+env/
+.venv/
+
+# Ignore local environment secrets
+.env
+
+# Ignore python caches and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Ignore source control and IDE files
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Ignore local scratch / test logs
+.system_generated/
+*.log
