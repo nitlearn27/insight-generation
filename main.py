@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -8,8 +9,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types
 from database import get_user_purchases_last_month, get_candidate_products
 
 app = FastAPI(title="Insight Generation API")
@@ -23,13 +22,66 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Configure Gemini API Client
+# Configure LLM provider
 load_dotenv() # Load variables from .env file
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-gemini_client = None
-if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# Active provider: OpenRouter (OpenAI-compatible chat completions API).
+# Gemini is parked for potential future use (see GEMINI_API_KEY in .env).
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Large reasoning models (e.g. gpt-oss-120b) can take ~20-60s+, so keep a generous
+# timeout and retry transient failures (timeouts, 5xx, empty/blank completions).
+OPENROUTER_TIMEOUT = 180
+OPENROUTER_MAX_RETRIES = 3
+
+
+def _call_openrouter(prompt: str) -> str:
+    """Sends the prompt to OpenRouter and returns the raw message content (expected JSON).
+
+    Retries on transient errors (network/timeouts, 5xx responses, empty completions)
+    with a short backoff, raising the last error if all attempts fail.
+    """
+    last_err = None
+    for attempt in range(OPENROUTER_MAX_RETRIES):
+        try:
+            resp = requests.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=OPENROUTER_TIMEOUT,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            if content and content.strip():
+                return content
+            last_err = ValueError("OpenRouter returned an empty completion")
+        except (requests.exceptions.RequestException, ValueError, KeyError, IndexError) as e:
+            last_err = e
+
+        # Back off before the next attempt (skip the wait after the final try)
+        if attempt < OPENROUTER_MAX_RETRIES - 1:
+            time.sleep(1.5 * (attempt + 1))
+
+    raise RuntimeError(
+        f"OpenRouter request failed after {OPENROUTER_MAX_RETRIES} attempts: {last_err}"
+    )
+
+
+def _extract_json(text: str) -> str:
+    """Defensively pulls the JSON object out of the model output (strips any prose/code fences)."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return text
 
 # --- In-memory caching (30 min TTL) ---
 CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
@@ -110,8 +162,8 @@ async def generate_insight(request: InsightRequest):
         )
 
     # 2. Generate Insight via LLM
-    if not gemini_client:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is not set.")
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY environment variable is not set.")
 
     current_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -171,16 +223,10 @@ async def generate_insight(request: InsightRequest):
     """
 
     try:
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            )
-        )
+        response_text = _call_openrouter(prompt)
 
-        # Parse the JSON response
-        result_dict = json.loads(response.text)
+        # Parse the JSON response (tolerant of surrounding prose/code fences)
+        result_dict = json.loads(_extract_json(response_text))
 
         # Validate using Pydantic
         insight_response = InsightResponse(**result_dict)

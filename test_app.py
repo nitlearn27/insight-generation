@@ -1,9 +1,9 @@
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 import main
-from main import app, InsightResponse
+from main import app
 
 client = TestClient(app)
 
@@ -18,11 +18,11 @@ def clear_caches():
     main._sfdc_cache.clear()
 
 
-# Test 1: Successful generation of insight using mock Gemini client
+# Test 1: Successful generation of insight using mock OpenRouter call
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_generate_insight_success(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_generate_insight_success(mock_call, mock_get_candidates, mock_get_purchases):
     # Mock data
     mock_get_purchases.return_value = [
         {
@@ -46,9 +46,8 @@ def test_generate_insight_success(mock_gemini_client, mock_get_candidates, mock_
         }
     ]
 
-    # Mock response from Gemini model
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
+    # Mock response content from the LLM
+    mock_call.return_value = json.dumps({
         "insight_message": "Based on your recent premium purchases, we have a top recommendation to enhance your new workstation setup.",
         "recommendations": [
             {
@@ -60,15 +59,11 @@ def test_generate_insight_success(mock_gemini_client, mock_get_candidates, mock_
             }
         ]
     })
-    
-    mock_gemini_client.models.generate_content.return_value = mock_response
 
-    # Temporarily ensure gemini_client is not None (in case environment variable wasn't set)
-    with patch("main.gemini_client", mock_gemini_client):
-        response = client.post(
-            "/api/insights/next-purchase",
-            json={"user_input": "Give me a recommendation"}
-        )
+    response = client.post(
+        "/api/insights/next-purchase",
+        json={"user_input": "Give me a recommendation"}
+    )
 
     assert response.status_code == 200
     data = response.json()
@@ -80,8 +75,8 @@ def test_generate_insight_success(mock_gemini_client, mock_get_candidates, mock_
 
 # Test 2: Fallback when user has no recent purchase history
 @patch("main.get_user_purchases_last_month")
-@patch("main.gemini_client")
-def test_generate_insight_no_history(mock_gemini_client, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_generate_insight_no_history(mock_call, mock_get_purchases):
     mock_get_purchases.return_value = []
 
     response = client.post(
@@ -93,15 +88,15 @@ def test_generate_insight_no_history(mock_gemini_client, mock_get_purchases):
     data = response.json()
     assert data["insight_message"] == "You don't have any recent purchases. Explore our catalog!"
     assert data["recommendations"] == []
-    # Assert Gemini API was never called
-    mock_gemini_client.models.generate_content.assert_not_called()
+    # Assert the LLM was never called
+    mock_call.assert_not_called()
 
 
 # Test 3: Fallback when candidate list is empty
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_generate_insight_no_candidates(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_generate_insight_no_candidates(mock_call, mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Headphones"}]
     mock_get_candidates.return_value = []
 
@@ -114,42 +109,41 @@ def test_generate_insight_no_candidates(mock_gemini_client, mock_get_candidates,
     data = response.json()
     assert data["insight_message"] == "You've bought all our top products! Check back later."
     assert data["recommendations"] == []
-    # Assert Gemini API was never called
-    mock_gemini_client.models.generate_content.assert_not_called()
+    # Assert the LLM was never called
+    mock_call.assert_not_called()
 
 
-# Test 4: Missing GEMINI_API_KEY config
+# Test 4: Missing OPENROUTER_API_KEY config
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
 def test_generate_insight_missing_api_key(mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Headphones"}]
     mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Keyboard"}]
 
-    with patch("main.gemini_client", None):
+    with patch("main.OPENROUTER_API_KEY", None):
         response = client.post(
             "/api/insights/next-purchase",
             json={"user_input": "Give recommendations"}
         )
 
     assert response.status_code == 500
-    assert "GEMINI_API_KEY environment variable is not set." in response.json()["detail"]
+    assert "OPENROUTER_API_KEY environment variable is not set." in response.json()["detail"]
 
 
-# Test 5: Gemini API errors out
+# Test 5: LLM call errors out
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_generate_insight_gemini_error(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_generate_insight_llm_error(mock_call, mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Headphones"}]
     mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Keyboard"}]
 
-    mock_gemini_client.models.generate_content.side_effect = Exception("API rate limit exceeded")
+    mock_call.side_effect = Exception("API rate limit exceeded")
 
-    with patch("main.gemini_client", mock_gemini_client):
-        response = client.post(
-            "/api/insights/next-purchase",
-            json={"user_input": "What to buy?"}
-        )
+    response = client.post(
+        "/api/insights/next-purchase",
+        json={"user_input": "What to buy?"}
+    )
 
     assert response.status_code == 500
     assert "Failed to generate insight: API rate limit exceeded" in response.json()["detail"]
@@ -168,8 +162,8 @@ def test_generate_insight_validation_error():
 # Test 7: User Input parsing and multiple recommendations success
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_generate_insight_preferences_and_multiple_recs(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_generate_insight_preferences_and_multiple_recs(mock_call, mock_get_candidates, mock_get_purchases):
     # Mock data
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Tata Salt"}]
     mock_get_candidates.return_value = [
@@ -177,9 +171,8 @@ def test_generate_insight_preferences_and_multiple_recs(mock_gemini_client, mock
         {"id": "prod_3", "title__c": "Apple Royal Gala", "Products_Name__c": "Apple Royal Gala", "source__c": "Amazon", "current_price__c": 91.0, "rating__c": "4.6", "product_url__c": "https://amazon.com/..."}
     ]
 
-    # Mock response from Gemini model returning multiple recommendations
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
+    # Mock LLM content returning multiple recommendations
+    mock_call.return_value = json.dumps({
         "insight_message": "Based on your interest in fresh ingredients and organic groceries, here are top recommendations from Amazon.",
         "recommendations": [
             {
@@ -198,15 +191,13 @@ def test_generate_insight_preferences_and_multiple_recs(mock_gemini_client, mock
             }
         ]
     })
-    mock_gemini_client.models.generate_content.return_value = mock_response
 
-    with patch("main.gemini_client", mock_gemini_client):
-        response = client.post(
-            "/api/insights/next-purchase",
-            json={
-                "user_input": "I only want organic items from Amazon"
-            }
-        )
+    response = client.post(
+        "/api/insights/next-purchase",
+        json={
+            "user_input": "I only want organic items from Amazon"
+        }
+    )
 
     assert response.status_code == 200
     data = response.json()
@@ -214,7 +205,7 @@ def test_generate_insight_preferences_and_multiple_recs(mock_gemini_client, mock
     assert len(data["recommendations"]) == 2
     assert data["recommendations"][0]["product_name"] == "Fresh Tomato"
     assert data["recommendations"][1]["product_name"] == "Apple Royal Gala"
-    
+
     # Assert database query was called with the candidates limit = 20
     mock_get_candidates.assert_called_once_with(["prod_1"], limit=20)
 
@@ -222,13 +213,12 @@ def test_generate_insight_preferences_and_multiple_recs(mock_gemini_client, mock
 # Test 8: Response validation matches all model fields
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_response_fields_completeness(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_response_fields_completeness(mock_call, mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Tata Salt"}]
     mock_get_candidates.return_value = [{"id": "prod_2", "title__c": "Fresh Tomato", "Products_Name__c": "Fresh Tomato", "source__c": "Amazon"}]
 
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
+    mock_call.return_value = json.dumps({
         "insight_message": "Insight summary text.",
         "recommendations": [
             {
@@ -240,22 +230,20 @@ def test_response_fields_completeness(mock_gemini_client, mock_get_candidates, m
             }
         ]
     })
-    mock_gemini_client.models.generate_content.return_value = mock_response
 
-    with patch("main.gemini_client", mock_gemini_client):
-        response = client.post(
-            "/api/insights/next-purchase",
-            json={"user_input": "Test completeness"}
-        )
+    response = client.post(
+        "/api/insights/next-purchase",
+        json={"user_input": "Test completeness"}
+    )
 
     assert response.status_code == 200
     data = response.json()
-    
+
     # Assert top-level fields are present
     assert "insight_message" in data
     assert "recommendations" in data
     assert len(data["recommendations"]) == 1
-    
+
     # Assert all Recommendation subfields are present and correctly typed
     rec = data["recommendations"][0]
     assert "product_name" in rec and isinstance(rec["product_name"], str)
@@ -268,13 +256,12 @@ def test_response_fields_completeness(mock_gemini_client, mock_get_candidates, m
 # Test 9: Highlights array round-trips in the response
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_generate_insight_highlights(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_generate_insight_highlights(mock_call, mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
     mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk", "source__c": "Amazon"}]
 
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
+    mock_call.return_value = json.dumps({
         "insight_message": "Time to refill your milk.",
         "recommendations": [
             {
@@ -287,10 +274,8 @@ def test_generate_insight_highlights(mock_gemini_client, mock_get_candidates, mo
             }
         ]
     })
-    mock_gemini_client.models.generate_content.return_value = mock_response
 
-    with patch("main.gemini_client", mock_gemini_client):
-        response = client.post("/api/insights/next-purchase", json={"user_input": "milk"})
+    response = client.post("/api/insights/next-purchase", json={"user_input": "milk"})
 
     assert response.status_code == 200
     rec = response.json()["recommendations"][0]
@@ -303,13 +288,12 @@ def test_generate_insight_highlights(mock_gemini_client, mock_get_candidates, mo
 # Test 10: highlights defaults to [] when the LLM omits it
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_generate_insight_highlights_default(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_generate_insight_highlights_default(mock_call, mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
     mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk"}]
 
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
+    mock_call.return_value = json.dumps({
         "insight_message": "A recommendation.",
         "recommendations": [
             {
@@ -321,25 +305,22 @@ def test_generate_insight_highlights_default(mock_gemini_client, mock_get_candid
             }
         ]
     })
-    mock_gemini_client.models.generate_content.return_value = mock_response
 
-    with patch("main.gemini_client", mock_gemini_client):
-        response = client.post("/api/insights/next-purchase", json={"user_input": "milk"})
+    response = client.post("/api/insights/next-purchase", json={"user_input": "milk"})
 
     assert response.status_code == 200
     assert response.json()["recommendations"][0]["highlights"] == []
 
 
-# Test 11: Response cache — identical input within TTL skips both SFDC and Gemini
+# Test 11: Response cache — identical input within TTL skips both SFDC and the LLM
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_response_cache_hit_same_input(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_response_cache_hit_same_input(mock_call, mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
     mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk"}]
 
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
+    mock_call.return_value = json.dumps({
         "insight_message": "Cached message.",
         "recommendations": [
             {
@@ -352,31 +333,28 @@ def test_response_cache_hit_same_input(mock_gemini_client, mock_get_candidates, 
             }
         ]
     })
-    mock_gemini_client.models.generate_content.return_value = mock_response
 
-    with patch("main.gemini_client", mock_gemini_client):
-        first = client.post("/api/insights/next-purchase", json={"user_input": "milk please"})
-        # Same input, different casing/whitespace -> normalized to the same cache key
-        second = client.post("/api/insights/next-purchase", json={"user_input": "  Milk Please  "})
+    first = client.post("/api/insights/next-purchase", json={"user_input": "milk please"})
+    # Same input, different casing/whitespace -> normalized to the same cache key
+    second = client.post("/api/insights/next-purchase", json={"user_input": "  Milk Please  "})
 
     assert first.status_code == 200 and second.status_code == 200
     assert first.json() == second.json()
-    # Gemini and SFDC should each only run once (second request served from cache)
-    assert mock_gemini_client.models.generate_content.call_count == 1
+    # LLM and SFDC should each only run once (second request served from cache)
+    assert mock_call.call_count == 1
     assert mock_get_purchases.call_count == 1
     assert mock_get_candidates.call_count == 1
 
 
-# Test 12: SFDC cache — different input reruns Gemini but reuses SFDC data
+# Test 12: SFDC cache — different input reruns the LLM but reuses SFDC data
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
-@patch("main.gemini_client")
-def test_sfdc_cache_hit_different_input(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+@patch("main._call_openrouter")
+def test_sfdc_cache_hit_different_input(mock_call, mock_get_candidates, mock_get_purchases):
     mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
     mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk"}]
 
-    mock_response = MagicMock()
-    mock_response.text = json.dumps({
+    mock_call.return_value = json.dumps({
         "insight_message": "A recommendation.",
         "recommendations": [
             {
@@ -389,16 +367,56 @@ def test_sfdc_cache_hit_different_input(mock_gemini_client, mock_get_candidates,
             }
         ]
     })
-    mock_gemini_client.models.generate_content.return_value = mock_response
 
-    with patch("main.gemini_client", mock_gemini_client):
-        client.post("/api/insights/next-purchase", json={"user_input": "milk"})
-        client.post("/api/insights/next-purchase", json={"user_input": "bread"})
+    client.post("/api/insights/next-purchase", json={"user_input": "milk"})
+    client.post("/api/insights/next-purchase", json={"user_input": "bread"})
 
-    # Distinct inputs -> two Gemini calls, but SFDC fetched only once (cache hit)
-    assert mock_gemini_client.models.generate_content.call_count == 2
+    # Distinct inputs -> two LLM calls, but SFDC fetched only once (cache hit)
+    assert mock_call.call_count == 2
     assert mock_get_purchases.call_count == 1
     assert mock_get_candidates.call_count == 1
+
+
+# Test 13: _call_openrouter retries a transient timeout, then succeeds
+def test_call_openrouter_retries_then_succeeds():
+    good = MagicMock()
+    good.raise_for_status.return_value = None
+    good.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    side_effects = [main.requests.exceptions.Timeout("slow"), good]
+    with patch("main.time.sleep"), \
+         patch("main.requests.post", side_effect=side_effects) as mock_post:
+        result = main._call_openrouter("hi")
+
+    assert result == '{"ok": true}'
+    assert mock_post.call_count == 2
+
+
+# Test 14: _call_openrouter raises after exhausting all retries
+def test_call_openrouter_raises_after_retries():
+    with patch("main.time.sleep"), \
+         patch("main.requests.post", side_effect=main.requests.exceptions.Timeout("slow")) as mock_post:
+        with pytest.raises(RuntimeError):
+            main._call_openrouter("hi")
+
+    assert mock_post.call_count == main.OPENROUTER_MAX_RETRIES
+
+
+# Test 15: _call_openrouter retries when the model returns an empty completion
+def test_call_openrouter_retries_on_empty_content():
+    empty = MagicMock()
+    empty.raise_for_status.return_value = None
+    empty.json.return_value = {"choices": [{"message": {"content": "   "}}]}
+    good = MagicMock()
+    good.raise_for_status.return_value = None
+    good.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    with patch("main.time.sleep"), \
+         patch("main.requests.post", side_effect=[empty, good]) as mock_post:
+        result = main._call_openrouter("hi")
+
+    assert result == '{"ok": true}'
+    assert mock_post.call_count == 2
 
 
 if __name__ == "__main__":
