@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -30,6 +31,22 @@ gemini_client = None
 if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# --- In-memory caching (30 min TTL) ---
+CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
+
+# Full response cache: key = (user_id, normalized user_input) -> (timestamp, InsightResponse)
+_response_cache: dict = {}
+# SFDC product data cache: key = user_id -> (timestamp, (recent_purchases, candidates))
+_sfdc_cache: dict = {}
+
+
+def _get_fresh(cache: dict, key):
+    """Returns the cached value if present and within the TTL window, else None."""
+    entry = cache.get(key)
+    if entry and (time.time() - entry[0]) < CACHE_TTL_SECONDS:
+        return entry[1]
+    return None
+
 # --- Pydantic Models ---
 
 class InsightRequest(BaseModel):
@@ -41,6 +58,7 @@ class Recommendation(BaseModel):
     price: float
     reasoning: str
     rating: str | None = None
+    highlights: List[str] = []
 
 class InsightResponse(BaseModel):
     insight_message: str
@@ -58,28 +76,40 @@ async def generate_insight(request: InsightRequest):
     Generates a personalized product recommendation based on the user's
     recent purchase history and the current product catalog.
     """
-    # 1. Fetch user's recent purchases
-    recent_purchases = get_user_purchases_last_month("default_user")
+    user_id = "default_user"
+    cache_input = request.user_input.strip().lower()
+
+    # 0. Response cache: identical input within the TTL skips both SFDC and Gemini
+    cached_response = _get_fresh(_response_cache, (user_id, cache_input))
+    if cached_response is not None:
+        return cached_response
+
+    # 1. Fetch user's recent purchases + candidates (SFDC), using a per-user cache
+    #    so even a brand-new input avoids re-hitting Salesforce within the TTL.
+    sfdc_data = _get_fresh(_sfdc_cache, user_id)
+    if sfdc_data is not None:
+        recent_purchases, candidates = sfdc_data
+    else:
+        recent_purchases = get_user_purchases_last_month(user_id)
+        purchased_ids = [p["id"] for p in recent_purchases]
+        # Fetch candidate products from catalog (exclude already purchased)
+        candidates = get_candidate_products(purchased_ids, limit=20) if recent_purchases else []
+        _sfdc_cache[user_id] = (time.time(), (recent_purchases, candidates))
+
     if not recent_purchases:
-        # Fallback if no history
+        # Fallback if no history (not cached — cheap and state-dependent)
         return InsightResponse(
             insight_message="You don't have any recent purchases. Explore our catalog!",
             recommendations=[]
         )
 
-    # 2. Extract purchased IDs
-    purchased_ids = [p["id"] for p in recent_purchases]
-
-    # 3. Fetch candidate products from catalog (exclude already purchased)
-    candidates = get_candidate_products(purchased_ids, limit=20)
-    
     if not candidates:
         return InsightResponse(
             insight_message="You've bought all our top products! Check back later.",
             recommendations=[]
         )
 
-    # 4. Generate Insight via LLM
+    # 2. Generate Insight via LLM
     if not gemini_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is not set.")
 
@@ -117,6 +147,13 @@ async def generate_insight(request: InsightRequest):
        - Think logically before recommending. For instance, do not recommend fresh tomatoes if they bought a large quantity yesterday, but do recommend it if they bought a small quantity 6 days ago.
        - Ensure the reasoning explicitly details these calculations (e.g., "Since you haven't purchased milk since June 1st and it has a 2-day freshness shelf life, we suggest refilling..." or "This tomato is now ₹26, which is cheaper than the ₹38 you paid on May 30th!").
 
+    HIGHLIGHTS (why we recommend):
+       - For each recommendation, include a "highlights" array of 1 to 3 short tags that summarize WHY it is recommended.
+       - Choose from this controlled vocabulary wherever applicable, and keep them consistent with your reasoning and the hierarchy above:
+         "Matches Preference" (Priority 1), "Refill Needed" (Priority 2), "Price Drop" (Priority 3), "Offer", "Top Rated", "Frequently Bought".
+       - Only if none of the above fit, you may add a short custom tag (2-3 words).
+       - Order the tags by relevance, most important first.
+
     Return your response strictly in the following JSON format:
     {{
       "insight_message": "A friendly introductory message summarizing the recommendations and highlighting the logical reasons (e.g., matching their input preferences, need for refills, or price drops).",
@@ -126,7 +163,8 @@ async def generate_insight(request: InsightRequest):
           "product_url": "<the product url>",
           "price": <number>,
           "reasoning": "<1-2 sentence explanation of why they should buy this product based on the logic above>",
-          "rating": "<rating string>"
+          "rating": "<rating string>",
+          "highlights": ["<short tag>", "<short tag>"]
         }}
       ]
     }}
@@ -140,13 +178,18 @@ async def generate_insight(request: InsightRequest):
                 response_mime_type="application/json",
             )
         )
-        
+
         # Parse the JSON response
         result_dict = json.loads(response.text)
-        
-        # Validate and return using Pydantic
-        return InsightResponse(**result_dict)
-    
+
+        # Validate using Pydantic
+        insight_response = InsightResponse(**result_dict)
+
+        # Cache the successful LLM result keyed by normalized input
+        _response_cache[(user_id, cache_input)] = (time.time(), insight_response)
+
+        return insight_response
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate insight: {str(e)}")
 

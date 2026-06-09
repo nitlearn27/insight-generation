@@ -7,6 +7,17 @@ from main import app, InsightResponse
 
 client = TestClient(app)
 
+
+@pytest.fixture(autouse=True)
+def clear_caches():
+    """Reset the module-level in-memory caches before each test to avoid leakage."""
+    main._response_cache.clear()
+    main._sfdc_cache.clear()
+    yield
+    main._response_cache.clear()
+    main._sfdc_cache.clear()
+
+
 # Test 1: Successful generation of insight using mock Gemini client
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
@@ -252,6 +263,142 @@ def test_response_fields_completeness(mock_gemini_client, mock_get_candidates, m
     assert "price" in rec and isinstance(rec["price"], (int, float))
     assert "reasoning" in rec and isinstance(rec["reasoning"], str)
     assert "rating" in rec and isinstance(rec["rating"], str)
+
+
+# Test 9: Highlights array round-trips in the response
+@patch("main.get_user_purchases_last_month")
+@patch("main.get_candidate_products")
+@patch("main.gemini_client")
+def test_generate_insight_highlights(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+    mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
+    mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk", "source__c": "Amazon"}]
+
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "insight_message": "Time to refill your milk.",
+        "recommendations": [
+            {
+                "product_name": "Fresh Milk",
+                "product_url": "https://amazon.com/milk",
+                "price": 30.0,
+                "reasoning": "You last bought milk 3 days ago and it's now cheaper.",
+                "rating": "4.5",
+                "highlights": ["Refill Needed", "Price Drop"]
+            }
+        ]
+    })
+    mock_gemini_client.models.generate_content.return_value = mock_response
+
+    with patch("main.gemini_client", mock_gemini_client):
+        response = client.post("/api/insights/next-purchase", json={"user_input": "milk"})
+
+    assert response.status_code == 200
+    rec = response.json()["recommendations"][0]
+    assert "highlights" in rec
+    assert isinstance(rec["highlights"], list)
+    assert all(isinstance(h, str) for h in rec["highlights"])
+    assert rec["highlights"] == ["Refill Needed", "Price Drop"]
+
+
+# Test 10: highlights defaults to [] when the LLM omits it
+@patch("main.get_user_purchases_last_month")
+@patch("main.get_candidate_products")
+@patch("main.gemini_client")
+def test_generate_insight_highlights_default(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+    mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
+    mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk"}]
+
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "insight_message": "A recommendation.",
+        "recommendations": [
+            {
+                "product_name": "Fresh Milk",
+                "product_url": "https://amazon.com/milk",
+                "price": 30.0,
+                "reasoning": "Good pick.",
+                "rating": "4.5"
+            }
+        ]
+    })
+    mock_gemini_client.models.generate_content.return_value = mock_response
+
+    with patch("main.gemini_client", mock_gemini_client):
+        response = client.post("/api/insights/next-purchase", json={"user_input": "milk"})
+
+    assert response.status_code == 200
+    assert response.json()["recommendations"][0]["highlights"] == []
+
+
+# Test 11: Response cache — identical input within TTL skips both SFDC and Gemini
+@patch("main.get_user_purchases_last_month")
+@patch("main.get_candidate_products")
+@patch("main.gemini_client")
+def test_response_cache_hit_same_input(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+    mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
+    mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk"}]
+
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "insight_message": "Cached message.",
+        "recommendations": [
+            {
+                "product_name": "Fresh Milk",
+                "product_url": "https://amazon.com/milk",
+                "price": 30.0,
+                "reasoning": "Good pick.",
+                "rating": "4.5",
+                "highlights": ["Top Rated"]
+            }
+        ]
+    })
+    mock_gemini_client.models.generate_content.return_value = mock_response
+
+    with patch("main.gemini_client", mock_gemini_client):
+        first = client.post("/api/insights/next-purchase", json={"user_input": "milk please"})
+        # Same input, different casing/whitespace -> normalized to the same cache key
+        second = client.post("/api/insights/next-purchase", json={"user_input": "  Milk Please  "})
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json() == second.json()
+    # Gemini and SFDC should each only run once (second request served from cache)
+    assert mock_gemini_client.models.generate_content.call_count == 1
+    assert mock_get_purchases.call_count == 1
+    assert mock_get_candidates.call_count == 1
+
+
+# Test 12: SFDC cache — different input reruns Gemini but reuses SFDC data
+@patch("main.get_user_purchases_last_month")
+@patch("main.get_candidate_products")
+@patch("main.gemini_client")
+def test_sfdc_cache_hit_different_input(mock_gemini_client, mock_get_candidates, mock_get_purchases):
+    mock_get_purchases.return_value = [{"id": "prod_1", "Products_Name__c": "Milk"}]
+    mock_get_candidates.return_value = [{"id": "prod_2", "Products_Name__c": "Fresh Milk"}]
+
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "insight_message": "A recommendation.",
+        "recommendations": [
+            {
+                "product_name": "Fresh Milk",
+                "product_url": "https://amazon.com/milk",
+                "price": 30.0,
+                "reasoning": "Good pick.",
+                "rating": "4.5",
+                "highlights": ["Top Rated"]
+            }
+        ]
+    })
+    mock_gemini_client.models.generate_content.return_value = mock_response
+
+    with patch("main.gemini_client", mock_gemini_client):
+        client.post("/api/insights/next-purchase", json={"user_input": "milk"})
+        client.post("/api/insights/next-purchase", json={"user_input": "bread"})
+
+    # Distinct inputs -> two Gemini calls, but SFDC fetched only once (cache hit)
+    assert mock_gemini_client.models.generate_content.call_count == 2
+    assert mock_get_purchases.call_count == 1
+    assert mock_get_candidates.call_count == 1
 
 
 if __name__ == "__main__":

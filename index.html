@@ -156,6 +156,21 @@
             padding-left: 10px;
         }
 
+        .highlights {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin: 10px 0 12px;
+        }
+
+        .highlights .chip {
+            font-size: 0.72rem;
+            padding: 3px 9px;
+            border-radius: 10px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
         .insight-card a {
             display: inline-block;
             background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(59, 130, 246, 0.2));
@@ -332,6 +347,16 @@
                 
                 let htmlContent = `<div style="font-weight: 500; font-size: 0.95rem; margin-bottom: 8px;">${data.insight_message}</div>`;
                 
+                const HIGHLIGHT_COLORS = {
+                    "Price Drop":         "background: rgba(16,185,129,0.15); color:#34d399;",
+                    "Refill Needed":      "background: rgba(59,130,246,0.15); color:#60a5fa;",
+                    "Offer":              "background: rgba(245,158,11,0.15); color:#fbbf24;",
+                    "Top Rated":          "background: rgba(139,92,246,0.15); color:#c4b5fd;",
+                    "Matches Preference": "background: rgba(236,72,153,0.15); color:#f472b6;",
+                    "Frequently Bought":  "background: rgba(20,184,166,0.15); color:#2dd4bf;"
+                };
+                const defaultChip = "background: rgba(148,163,184,0.15); color:#cbd5e1;";
+
                 if (data.recommendations && data.recommendations.length > 0) {
                     data.recommendations.forEach(rec => {
                         const isAmazon = rec.product_url.toLowerCase().includes('amazon');
@@ -343,6 +368,12 @@
 
                         const ratingText = rec.rating ? `⭐ ${rec.rating} Rating` : 'No rating';
 
+                        const highlightsHtml = (rec.highlights && rec.highlights.length)
+                            ? `<div class="highlights">${rec.highlights.map(h =>
+                                `<span class="chip" style="${HIGHLIGHT_COLORS[h] || defaultChip}">${h}</span>`
+                              ).join('')}</div>`
+                            : '';
+
                         htmlContent += `
                             <div class="insight-card">
                                 <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px;">
@@ -352,6 +383,7 @@
                                     </span>
                                 </div>
                                 <div class="price">₹${rec.price}</div>
+                                ${highlightsHtml}
                                 <div class="reasoning">${rec.reasoning}</div>
                                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
                                     <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">${ratingText}</span>
