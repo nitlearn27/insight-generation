@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import time
 import requests
 from datetime import datetime
@@ -10,6 +11,9 @@ from pydantic import BaseModel
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 from database import get_user_purchases_last_month, get_candidate_products
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("insight")
 
 app = FastAPI(title="Insight Generation API")
 
@@ -28,24 +32,50 @@ load_dotenv() # Load variables from .env file
 # Active provider: OpenRouter (OpenAI-compatible chat completions API).
 # Gemini is parked for potential future use (see GEMINI_API_KEY in .env).
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
+# Free models are frequently congested/rate-limited; OpenRouter's `models` array
+# falls back to the next entry in a single request instead of erroring out.
+# OpenRouter allows at most 3 models per request, so pick fallbacks from
+# different provider pools (Google, Nvidia) than the primary (Venice).
+OPENROUTER_FALLBACK_MODELS = [
+    m.strip() for m in os.environ.get(
+        "OPENROUTER_FALLBACK_MODELS",
+        "google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-super-120b-a12b:free",
+    ).split(",") if m.strip()
+]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Large reasoning models (e.g. gpt-oss-120b) can take ~20-60s+, so keep a generous
-# timeout and retry transient failures (timeouts, 5xx, empty/blank completions).
-OPENROUTER_TIMEOUT = 180
+# Fast non-reasoning instruct model: responses typically land within a few seconds.
+# Keep the timeout short so congested free pools fail fast into a retry instead of
+# holding the connection. Retry transient failures (timeouts, 5xx, empty completions).
+OPENROUTER_TIMEOUT = int(os.environ.get("OPENROUTER_TIMEOUT", "30"))
 OPENROUTER_MAX_RETRIES = 3
 
+# Gemini fallback: tried when the first OpenRouter attempt fails (needs a valid
+# key from https://aistudio.google.com/apikey in GEMINI_API_KEY).
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-def _call_openrouter(prompt: str) -> str:
+# Which provider to try first each round. Gemini's free tier has a dedicated
+# per-key quota (~250 req/day), while OpenRouter free models share one
+# account-wide 50 req/day cap — so Gemini is the more reliable primary.
+LLM_PRIMARY = os.environ.get("LLM_PRIMARY", "gemini" if GEMINI_API_KEY else "openrouter")
+
+# Reuse one HTTP connection (TLS handshake) across OpenRouter calls
+_session = requests.Session()
+
+
+def _call_openrouter(prompt: str, max_retries: int = OPENROUTER_MAX_RETRIES) -> str:
     """Sends the prompt to OpenRouter and returns the raw message content (expected JSON).
 
     Retries on transient errors (network/timeouts, 5xx responses, empty completions)
     with a short backoff, raising the last error if all attempts fail.
     """
     last_err = None
-    for attempt in range(OPENROUTER_MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
-            resp = requests.post(
+            logger.info("Calling OpenRouter (model=%s, attempt %d/%d)", OPENROUTER_MODEL, attempt + 1, max_retries)
+            resp = _session.post(
                 OPENROUTER_URL,
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -53,6 +83,8 @@ def _call_openrouter(prompt: str) -> str:
                 },
                 json={
                     "model": OPENROUTER_MODEL,
+                    # OpenRouter rejects more than 3 entries
+                    "models": [OPENROUTER_MODEL, *OPENROUTER_FALLBACK_MODELS][:3],
                     "messages": [{"role": "user", "content": prompt}],
                     "response_format": {"type": "json_object"},
                 },
@@ -66,12 +98,80 @@ def _call_openrouter(prompt: str) -> str:
         except (requests.exceptions.RequestException, ValueError, KeyError, IndexError) as e:
             last_err = e
 
-        # Back off before the next attempt (skip the wait after the final try)
-        if attempt < OPENROUTER_MAX_RETRIES - 1:
-            time.sleep(1.5 * (attempt + 1))
+        # Back off before the next attempt (skip the wait after the final try).
+        # 429s need a real cooldown — free-tier limits are per-minute, so quick
+        # retries only burn more quota.
+        if attempt < max_retries - 1:
+            status = getattr(getattr(last_err, "response", None), "status_code", None)
+            time.sleep(10.0 * (attempt + 1) if status == 429 else 1.5 * (attempt + 1))
 
     raise RuntimeError(
-        f"OpenRouter request failed after {OPENROUTER_MAX_RETRIES} attempts: {last_err}"
+        f"OpenRouter request failed after {max_retries} attempts: {last_err}"
+    )
+
+
+def _call_gemini(prompt: str) -> str:
+    """Sends the prompt to the Gemini API and returns the raw message content (expected JSON)."""
+    logger.info("Calling Gemini (model=%s)", GEMINI_MODEL)
+    resp = _session.post(
+        GEMINI_URL,
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                # The picking task doesn't need reasoning; zero thinking budget
+                # cuts gemini-2.5-flash latency from ~20s to a few seconds.
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        },
+        timeout=OPENROUTER_TIMEOUT,
+    )
+    resp.raise_for_status()
+    content = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    if not content or not content.strip():
+        raise ValueError("Gemini returned an empty completion")
+    return content
+
+
+LLM_MAX_ROUNDS = 3
+
+
+def _call_llm(prompt: str) -> str:
+    """Alternates between the primary and fallback provider until one succeeds.
+
+    Both free tiers fail transiently (OpenRouter: 429 congestion/daily cap;
+    Gemini: 503 overload), so rather than exhausting one provider before
+    switching, each round tries each provider once, with a growing pause
+    between rounds to let the transient errors clear.
+    """
+    providers = [("OpenRouter", lambda: _call_openrouter(prompt, max_retries=1))]
+    if GEMINI_API_KEY:
+        gemini = ("Gemini", lambda: _call_gemini(prompt))
+        if LLM_PRIMARY == "gemini":
+            providers.insert(0, gemini)
+        else:
+            providers.append(gemini)
+    else:
+        logger.info("GEMINI_API_KEY not set; using OpenRouter only")
+
+    last_err = None
+    for round_num in range(LLM_MAX_ROUNDS):
+        if round_num:
+            time.sleep(2.0 * round_num)
+
+        for name, call in providers:
+            try:
+                return call()
+            except Exception as e:
+                logger.warning("%s attempt failed: %s", name, e)
+                last_err = e
+
+    raise RuntimeError(
+        f"All LLM providers failed after {LLM_MAX_ROUNDS} rounds: {last_err}"
     )
 
 
@@ -82,6 +182,23 @@ def _extract_json(text: str) -> str:
     if start != -1 and end != -1 and end > start:
         return text[start:end + 1]
     return text
+
+
+# Only the fields the recommendation logic actually reasons over — anything more
+# just inflates input tokens and slows the LLM down.
+_PROMPT_FIELDS = (
+    "Products_Name__c", "brand__c", "category__c", "current_price__c",
+    "last_purchased_price__c", "purchase_date", "rating__c", "source__c",
+    "product_url__c", "number_of_times_purchased__c", "availability__c",
+)
+
+
+def _slim_for_prompt(records: List[dict]) -> List[dict]:
+    """Projects records down to the prompt-relevant fields, dropping empty values."""
+    return [
+        {k: r[k] for k in _PROMPT_FIELDS if r.get(k) is not None}
+        for r in records
+    ]
 
 # --- In-memory caching (30 min TTL) ---
 CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
@@ -123,7 +240,7 @@ async def serve_index():
     return FileResponse("index.html")
 
 @app.post("/api/insights/next-purchase", response_model=InsightResponse)
-async def generate_insight(request: InsightRequest):
+def generate_insight(request: InsightRequest):
     """
     Generates a personalized product recommendation based on the user's
     recent purchase history and the current product catalog.
@@ -142,11 +259,13 @@ async def generate_insight(request: InsightRequest):
     if sfdc_data is not None:
         recent_purchases, candidates = sfdc_data
     else:
+        t0 = time.perf_counter()
         recent_purchases = get_user_purchases_last_month(user_id)
         purchased_ids = [p["id"] for p in recent_purchases]
         # Fetch candidate products from catalog (exclude already purchased)
         candidates = get_candidate_products(purchased_ids, limit=20) if recent_purchases else []
         _sfdc_cache[user_id] = (time.time(), (recent_purchases, candidates))
+        logger.info("SFDC fetch took %.2fs", time.perf_counter() - t0)
 
     if not recent_purchases:
         # Fallback if no history (not cached — cheap and state-dependent)
@@ -174,10 +293,10 @@ async def generate_insight(request: InsightRequest):
     Current Date: {current_date}
 
     User's recent purchases:
-    {json.dumps(recent_purchases, indent=2)}
+    {json.dumps(_slim_for_prompt(recent_purchases))}
 
     Candidate products to choose from:
-    {json.dumps(candidates, indent=2)}
+    {json.dumps(_slim_for_prompt(candidates))}
 
     User Input Preference: "{request.user_input}"
 
@@ -223,7 +342,9 @@ async def generate_insight(request: InsightRequest):
     """
 
     try:
-        response_text = _call_openrouter(prompt)
+        t0 = time.perf_counter()
+        response_text = _call_llm(prompt)
+        logger.info("LLM call took %.2fs", time.perf_counter() - t0)
 
         # Parse the JSON response (tolerant of surrounding prose/code fences)
         result_dict = json.loads(_extract_json(response_text))
@@ -237,5 +358,6 @@ async def generate_insight(request: InsightRequest):
         return insight_response
 
     except Exception as e:
+        logger.exception("Insight generation failed")
         raise HTTPException(status_code=500, detail=f"Failed to generate insight: {str(e)}")
 

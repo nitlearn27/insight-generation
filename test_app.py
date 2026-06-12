@@ -18,6 +18,15 @@ def clear_caches():
     main._sfdc_cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def openrouter_primary_no_gemini(monkeypatch):
+    """Default tests to OpenRouter-primary with Gemini disabled so a real
+    GEMINI_API_KEY in .env can never cause live network calls. Individual
+    tests re-enable Gemini by patching GEMINI_API_KEY and _call_gemini."""
+    monkeypatch.setattr(main, "LLM_PRIMARY", "openrouter")
+    monkeypatch.setattr(main, "GEMINI_API_KEY", None)
+
+
 # Test 1: Successful generation of insight using mock OpenRouter call
 @patch("main.get_user_purchases_last_month")
 @patch("main.get_candidate_products")
@@ -140,13 +149,16 @@ def test_generate_insight_llm_error(mock_call, mock_get_candidates, mock_get_pur
 
     mock_call.side_effect = Exception("API rate limit exceeded")
 
-    response = client.post(
-        "/api/insights/next-purchase",
-        json={"user_input": "What to buy?"}
-    )
+    # Disable the Gemini fallback so the OpenRouter failure surfaces as a 500
+    # (and the test never makes a real network call).
+    with patch("main.GEMINI_API_KEY", None), patch("main.time.sleep"):
+        response = client.post(
+            "/api/insights/next-purchase",
+            json={"user_input": "What to buy?"}
+        )
 
     assert response.status_code == 500
-    assert "Failed to generate insight: API rate limit exceeded" in response.json()["detail"]
+    assert "API rate limit exceeded" in response.json()["detail"]
 
 
 # Test 6: Request validation error (e.g. missing user_input)
@@ -385,7 +397,7 @@ def test_call_openrouter_retries_then_succeeds():
 
     side_effects = [main.requests.exceptions.Timeout("slow"), good]
     with patch("main.time.sleep"), \
-         patch("main.requests.post", side_effect=side_effects) as mock_post:
+         patch("main._session.post", side_effect=side_effects) as mock_post:
         result = main._call_openrouter("hi")
 
     assert result == '{"ok": true}'
@@ -395,7 +407,7 @@ def test_call_openrouter_retries_then_succeeds():
 # Test 14: _call_openrouter raises after exhausting all retries
 def test_call_openrouter_raises_after_retries():
     with patch("main.time.sleep"), \
-         patch("main.requests.post", side_effect=main.requests.exceptions.Timeout("slow")) as mock_post:
+         patch("main._session.post", side_effect=main.requests.exceptions.Timeout("slow")) as mock_post:
         with pytest.raises(RuntimeError):
             main._call_openrouter("hi")
 
@@ -412,11 +424,76 @@ def test_call_openrouter_retries_on_empty_content():
     good.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
 
     with patch("main.time.sleep"), \
-         patch("main.requests.post", side_effect=[empty, good]) as mock_post:
+         patch("main._session.post", side_effect=[empty, good]) as mock_post:
         result = main._call_openrouter("hi")
 
     assert result == '{"ok": true}'
     assert mock_post.call_count == 2
+
+
+# Test 16: _call_llm falls back to Gemini when the first OpenRouter attempt fails
+def test_llm_falls_back_to_gemini():
+    with patch("main._call_openrouter", side_effect=RuntimeError("congested")) as mock_or, \
+         patch("main.GEMINI_API_KEY", "test-key"), \
+         patch("main._call_gemini", return_value='{"ok": 1}') as mock_gemini:
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 1}'
+    mock_or.assert_called_once_with("hi", max_retries=1)
+    mock_gemini.assert_called_once_with("hi")
+
+
+# Test 17: _call_llm alternates back to OpenRouter when Gemini also fails
+def test_llm_gemini_fails_then_openrouter_retries():
+    or_results = [RuntimeError("congested"), '{"ok": 2}']
+    with patch("main._call_openrouter", side_effect=or_results) as mock_or, \
+         patch("main.GEMINI_API_KEY", "test-key"), \
+         patch("main._call_gemini", side_effect=RuntimeError("overloaded")) as mock_gemini, \
+         patch("main.time.sleep"):
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 2}'
+    assert mock_or.call_count == 2
+    mock_gemini.assert_called_once()
+
+
+# Test 18: _call_llm skips Gemini entirely when no GEMINI_API_KEY is configured
+def test_llm_skips_gemini_without_key():
+    or_results = [RuntimeError("congested"), '{"ok": 3}']
+    with patch("main._call_openrouter", side_effect=or_results) as mock_or, \
+         patch("main.GEMINI_API_KEY", None), \
+         patch("main._call_gemini") as mock_gemini, \
+         patch("main.time.sleep"):
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 3}'
+    mock_gemini.assert_not_called()
+
+
+# Test 19: with Gemini as primary, OpenRouter is never called when Gemini succeeds
+def test_llm_gemini_primary_called_first():
+    with patch("main._call_openrouter") as mock_or, \
+         patch("main.GEMINI_API_KEY", "test-key"), \
+         patch("main.LLM_PRIMARY", "gemini"), \
+         patch("main._call_gemini", return_value='{"ok": 4}') as mock_gemini:
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 4}'
+    mock_gemini.assert_called_once_with("hi")
+    mock_or.assert_not_called()
+
+
+# Test 20: _call_llm raises after all rounds of both providers fail
+def test_llm_raises_after_all_rounds():
+    with patch("main._call_openrouter", side_effect=RuntimeError("congested")) as mock_or, \
+         patch("main.GEMINI_API_KEY", "test-key"), \
+         patch("main._call_gemini", side_effect=RuntimeError("overloaded")) as mock_gemini, \
+         patch("main.time.sleep"):
+        with pytest.raises(RuntimeError, match="All LLM providers failed"):
+            main._call_llm("hi")
+
+    assert mock_or.call_count == main.LLM_MAX_ROUNDS
+    assert mock_gemini.call_count == main.LLM_MAX_ROUNDS
 
 
 if __name__ == "__main__":

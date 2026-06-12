@@ -21,4 +21,6 @@ This repository contains the backend service for generating personalized "What s
 2. Run the development server:
    ```bash
    uvicorn main:app --reload
+   or
+   ./venv/bin/uvicorn main:app --reload
    ```
