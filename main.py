@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import requests
+import anthropic
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -29,14 +30,26 @@ app.add_middleware(
 # Configure LLM provider
 load_dotenv() # Load variables from .env file
 
-# Active provider: OpenRouter (OpenAI-compatible chat completions API).
-# Gemini is parked for potential future use (see GEMINI_API_KEY in .env).
+# GLM 5.2 via ZenMux (Anthropic-compatible Messages API). Preferred primary:
+# free tier with its own quota pool, separate from Gemini/OpenRouter limits.
+GLM_API_KEY = os.environ.get("GLM_API_KEY")
+GLM_MODEL = os.environ.get("GLM_MODEL", "z-ai/glm-5.2-free")
+GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "https://zenmux.ai/api/anthropic")
+# Reasoning is mandatory on this endpoint and thinking tokens count against the
+# budget, so leave enough headroom for both the thinking trace and the JSON output.
+GLM_MAX_TOKENS = int(os.environ.get("GLM_MAX_TOKENS", "4096"))
+_glm_client = (
+    anthropic.Anthropic(api_key=GLM_API_KEY, base_url=GLM_BASE_URL)
+    if GLM_API_KEY else None
+)
+
+# OpenRouter (OpenAI-compatible chat completions API).
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
 # Free models are frequently congested/rate-limited; OpenRouter's `models` array
 # falls back to the next entry in a single request instead of erroring out.
 # OpenRouter allows at most 3 models per request, so pick fallbacks from
-# different provider pools (Google, Nvidia) than the primary (Venice).
+# different provider pools (Google, Nvidia) than the primary (OpenAI GPT).
 OPENROUTER_FALLBACK_MODELS = [
     m.strip() for m in os.environ.get(
         "OPENROUTER_FALLBACK_MODELS",
@@ -56,13 +69,52 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-# Which provider to try first each round. Gemini's free tier has a dedicated
-# per-key quota (~250 req/day), while OpenRouter free models share one
-# account-wide 50 req/day cap — so Gemini is the more reliable primary.
-LLM_PRIMARY = os.environ.get("LLM_PRIMARY", "gemini" if GEMINI_API_KEY else "openrouter")
+# AINative Studio (https://ainative.studio): OpenAI-compatible endpoint with a
+# free tier. Activates as an extra provider once AINATIVE_API_KEY is set.
+AINATIVE_API_KEY = os.environ.get("AINATIVE_API_KEY")
+AINATIVE_MODEL = os.environ.get("AINATIVE_MODEL", "llama-3.3-70b")
+AINATIVE_URL = "https://api.ainative.studio/v1/chat/completions"
+
+# NVIDIA NIM (https://integrate.api.nvidia.com) — OpenAI-compatible, free tier.
+# Preferred primary: separate quota pool from Gemini/GLM/OpenRouter.
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "meta/llama-3.1-8b-instruct")
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+# Which provider to try first each round ("nvidia" | "gemini" | "glm" | "openrouter" | "ainative").
+# NVIDIA NIM free is the preferred primary (its own quota pool); the default order
+# is NVIDIA → Gemini → GLM → OpenRouter, with OpenRouter's shared account-wide
+# free cap kept as the last resort.
+LLM_PRIMARY = os.environ.get(
+    "LLM_PRIMARY",
+    "nvidia" if NVIDIA_API_KEY else (
+        "gemini" if GEMINI_API_KEY else ("glm" if GLM_API_KEY else "openrouter")
+    ),
+)
 
 # Reuse one HTTP connection (TLS handshake) across OpenRouter calls
 _session = requests.Session()
+
+
+def _call_glm(prompt: str) -> str:
+    """Sends the prompt to GLM 5.2 via ZenMux (Anthropic Messages API) and returns
+    the raw text content (expected JSON). The Messages API has no JSON-mode flag,
+    so the prompt asks for JSON and _extract_json strips any surrounding prose."""
+    logger.info("Calling GLM (model=%s)", GLM_MODEL)
+    message = _glm_client.messages.create(
+        model=GLM_MODEL,
+        max_tokens=GLM_MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    # Even with thinking disabled, defensively concatenate only text blocks
+    # rather than assuming content[0] is text.
+    content = "".join(
+        block.text for block in message.content
+        if getattr(block, "type", None) == "text"
+    )
+    if not content or not content.strip():
+        raise ValueError("GLM returned an empty completion")
+    return content
 
 
 def _call_openrouter(prompt: str, max_retries: int = OPENROUTER_MAX_RETRIES) -> str:
@@ -140,23 +192,79 @@ def _call_gemini(prompt: str) -> str:
 LLM_MAX_ROUNDS = 3
 
 
-def _call_llm(prompt: str) -> str:
-    """Alternates between the primary and fallback provider until one succeeds.
+def _call_ainative(prompt: str) -> str:
+    """Sends the prompt to AINative Studio (OpenAI-compatible) and returns the raw content."""
+    logger.info("Calling AINative (model=%s)", AINATIVE_MODEL)
+    resp = _session.post(
+        AINATIVE_URL,
+        headers={
+            "Authorization": f"Bearer {AINATIVE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": AINATIVE_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+        },
+        timeout=OPENROUTER_TIMEOUT,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    if not content or not content.strip():
+        raise ValueError("AINative returned an empty completion")
+    return content
 
-    Both free tiers fail transiently (OpenRouter: 429 congestion/daily cap;
+
+def _call_nvidia(prompt: str) -> str:
+    """Sends the prompt to NVIDIA NIM (OpenAI-compatible) and returns the raw content.
+    response_format is intentionally omitted — meta/llama-3.1-8b-instruct on NIM can
+    reject JSON mode; the prompt asks for JSON and _extract_json strips any prose."""
+    logger.info("Calling NVIDIA (model=%s)", NVIDIA_MODEL)
+    resp = _session.post(
+        NVIDIA_URL,
+        headers={
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": NVIDIA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=OPENROUTER_TIMEOUT,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    if not content or not content.strip():
+        raise ValueError("NVIDIA returned an empty completion")
+    return content
+
+
+def _call_llm(prompt: str) -> str:
+    """Alternates between the configured providers until one succeeds.
+
+    All free tiers fail transiently (OpenRouter: 429 congestion/daily cap;
     Gemini: 503 overload), so rather than exhausting one provider before
     switching, each round tries each provider once, with a growing pause
     between rounds to let the transient errors clear.
     """
-    providers = [("OpenRouter", lambda: _call_openrouter(prompt, max_retries=1))]
+    # Base order NVIDIA → Gemini → GLM → AINative → OpenRouter; OpenRouter is always
+    # present and kept last as the shared-cap last resort.
+    providers = []
+    if NVIDIA_API_KEY:
+        providers.append(("NVIDIA", lambda: _call_nvidia(prompt)))
     if GEMINI_API_KEY:
-        gemini = ("Gemini", lambda: _call_gemini(prompt))
-        if LLM_PRIMARY == "gemini":
-            providers.insert(0, gemini)
-        else:
-            providers.append(gemini)
-    else:
-        logger.info("GEMINI_API_KEY not set; using OpenRouter only")
+        providers.append(("Gemini", lambda: _call_gemini(prompt)))
+    if GLM_API_KEY:
+        providers.append(("GLM", lambda: _call_glm(prompt)))
+    if AINATIVE_API_KEY:
+        providers.append(("AINative", lambda: _call_ainative(prompt)))
+    providers.append(("OpenRouter", lambda: _call_openrouter(prompt, max_retries=1)))
+    if len(providers) == 1:
+        logger.info("No NVIDIA_API_KEY/GEMINI_API_KEY/GLM_API_KEY/AINATIVE_API_KEY set; using OpenRouter only")
+
+    # Move the configured primary to the front; the rest keep their order
+    # (sort is stable, and False sorts before True).
+    providers.sort(key=lambda p: p[0].lower() != LLM_PRIMARY)
 
     last_err = None
     for round_num in range(LLM_MAX_ROUNDS):

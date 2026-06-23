@@ -19,12 +19,16 @@ def clear_caches():
 
 
 @pytest.fixture(autouse=True)
-def openrouter_primary_no_gemini(monkeypatch):
-    """Default tests to OpenRouter-primary with Gemini disabled so a real
-    GEMINI_API_KEY in .env can never cause live network calls. Individual
-    tests re-enable Gemini by patching GEMINI_API_KEY and _call_gemini."""
+def openrouter_primary_no_fallbacks(monkeypatch):
+    """Default tests to OpenRouter-primary with the fallback providers disabled
+    so real keys in .env can never cause live network calls. Individual tests
+    re-enable a provider by patching its key and _call_* function."""
     monkeypatch.setattr(main, "LLM_PRIMARY", "openrouter")
+    monkeypatch.setattr(main, "GLM_API_KEY", None)
+    monkeypatch.setattr(main, "_glm_client", None)
     monkeypatch.setattr(main, "GEMINI_API_KEY", None)
+    monkeypatch.setattr(main, "AINATIVE_API_KEY", None)
+    monkeypatch.setattr(main, "NVIDIA_API_KEY", None)
 
 
 # Test 1: Successful generation of insight using mock OpenRouter call
@@ -483,7 +487,46 @@ def test_llm_gemini_primary_called_first():
     mock_or.assert_not_called()
 
 
-# Test 20: _call_llm raises after all rounds of both providers fail
+# Test 20: AINative joins the rotation as a fallback when its key is set
+def test_llm_ainative_in_rotation():
+    with patch("main._call_openrouter", side_effect=RuntimeError("capped")) as mock_or, \
+         patch("main.AINATIVE_API_KEY", "test-key"), \
+         patch("main._call_ainative", return_value='{"ok": 5}') as mock_ai, \
+         patch("main.time.sleep"):
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 5}'
+    mock_or.assert_called_once()
+    mock_ai.assert_called_once_with("hi")
+
+
+# Test 21: LLM_PRIMARY="ainative" puts AINative first
+def test_llm_ainative_primary_called_first():
+    with patch("main._call_openrouter") as mock_or, \
+         patch("main.AINATIVE_API_KEY", "test-key"), \
+         patch("main.LLM_PRIMARY", "ainative"), \
+         patch("main._call_ainative", return_value='{"ok": 6}') as mock_ai:
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 6}'
+    mock_ai.assert_called_once_with("hi")
+    mock_or.assert_not_called()
+
+
+# Test 22b: LLM_PRIMARY="nvidia" puts NVIDIA first; OpenRouter is never reached
+def test_llm_nvidia_primary_called_first():
+    with patch("main._call_openrouter") as mock_or, \
+         patch("main.NVIDIA_API_KEY", "test-key"), \
+         patch("main.LLM_PRIMARY", "nvidia"), \
+         patch("main._call_nvidia", return_value='{"ok": 7}') as mock_nv:
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 7}'
+    mock_nv.assert_called_once_with("hi")
+    mock_or.assert_not_called()
+
+
+# Test 22: _call_llm raises after all rounds of both providers fail
 def test_llm_raises_after_all_rounds():
     with patch("main._call_openrouter", side_effect=RuntimeError("congested")) as mock_or, \
          patch("main.GEMINI_API_KEY", "test-key"), \
