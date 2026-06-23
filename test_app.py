@@ -461,6 +461,20 @@ def test_llm_gemini_fails_then_openrouter_retries():
     mock_gemini.assert_called_once()
 
 
+# Test 17b: a provider that returns non-JSON prose falls through to the next provider
+def test_llm_non_json_falls_through():
+    with patch("main.NVIDIA_API_KEY", "test-key"), \
+         patch("main.LLM_PRIMARY", "nvidia"), \
+         patch("main._call_nvidia", return_value="Sure! Here are some picks for you.") as mock_nv, \
+         patch("main._call_openrouter", return_value='{"ok": 9}') as mock_or, \
+         patch("main.time.sleep"):
+        result = main._call_llm("hi")
+
+    assert result == '{"ok": 9}'
+    mock_nv.assert_called()
+    mock_or.assert_called()
+
+
 # Test 18: _call_llm skips Gemini entirely when no GEMINI_API_KEY is configured
 def test_llm_skips_gemini_without_key():
     or_results = [RuntimeError("congested"), '{"ok": 3}']

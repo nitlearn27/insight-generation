@@ -217,8 +217,8 @@ def _call_ainative(prompt: str) -> str:
 
 def _call_nvidia(prompt: str) -> str:
     """Sends the prompt to NVIDIA NIM (OpenAI-compatible) and returns the raw content.
-    response_format is intentionally omitted — meta/llama-3.1-8b-instruct on NIM can
-    reject JSON mode; the prompt asks for JSON and _extract_json strips any prose."""
+    JSON mode is enforced — meta/llama-3.1-8b-instruct on NIM accepts response_format
+    and without it the small model tends to return prose that breaks JSON parsing."""
     logger.info("Calling NVIDIA (model=%s)", NVIDIA_MODEL)
     resp = _session.post(
         NVIDIA_URL,
@@ -229,6 +229,7 @@ def _call_nvidia(prompt: str) -> str:
         json={
             "model": NVIDIA_MODEL,
             "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
         },
         timeout=OPENROUTER_TIMEOUT,
     )
@@ -273,10 +274,22 @@ def _call_llm(prompt: str) -> str:
 
         for name, call in providers:
             try:
-                return call()
+                text = call()
             except Exception as e:
                 logger.warning("%s attempt failed: %s", name, e)
                 last_err = e
+                continue
+            # A 200 with a non-JSON body still isn't a usable answer — small models
+            # without a JSON-mode flag (e.g. NVIDIA NIM) can return prose. Validate
+            # here so the rotation falls through to the next provider instead of
+            # dying in the caller's json.loads with no fallback.
+            try:
+                json.loads(_extract_json(text))
+            except (ValueError, TypeError) as e:
+                logger.warning("%s returned non-JSON, trying next provider: %.200s", name, text)
+                last_err = e
+                continue
+            return text
 
     raise RuntimeError(
         f"All LLM providers failed after {LLM_MAX_ROUNDS} rounds: {last_err}"
@@ -435,13 +448,13 @@ def generate_insight(request: InsightRequest):
 
     Return your response strictly in the following JSON format:
     {{
-      "insight_message": "A friendly introductory message summarizing the recommendations and highlighting the logical reasons (e.g., matching their input preferences, need for refills, or price drops).",
+      "insight_message": "One short friendly line (max ~15 words) summarizing the recommendations.",
       "recommendations": [
         {{
           "product_name": "<the product name>",
           "product_url": "<the product url>",
           "price": <number>,
-          "reasoning": "<1-2 sentence explanation of why they should buy this product based on the logic above>",
+          "reasoning": "<one concise sentence (max ~20 words) explaining why to buy this, based on the logic above>",
           "rating": "<rating string>",
           "highlights": ["<short tag>", "<short tag>"]
         }}
